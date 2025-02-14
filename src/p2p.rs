@@ -11,15 +11,13 @@ use bitcoin::{
     Block, BlockHash, Network,
 };
 use bitcoinkernel::ChainstateManager;
+use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use dns_lookup::lookup_host;
 use log::{error, info};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     str::FromStr,
-    sync::{
-        mpsc::{channel, Receiver, Sender},
-        Arc,
-    },
+    sync::Arc,
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -39,19 +37,25 @@ fn get_nodes(network: Network) -> Result<Vec<IpAddr>, NodeError> {
 
 pub struct PeerManager {
     chain_manager: ChainstateManager,
-    peers: Vec<Peer>,
+    //peers: Vec<Peer>,
     // receive new blocks on this channel. This should check if block was already seen
     // if so, ignore. If not, process block by passing to ChainstateManager
     blocks_channel: (Sender<Block>, Receiver<Block>),
+    shutdown_signal: Receiver<bool>,
     network: Network,
 }
 
 impl PeerManager {
-    pub fn new(chain_manager: ChainstateManager, network: Network) -> Self {
+    pub fn new(
+        chain_manager: ChainstateManager,
+        shutdown_signal: crossbeam_channel::Receiver<bool>,
+        network: Network,
+    ) -> Self {
         PeerManager {
             chain_manager,
-            peers: Vec::new(),
-            blocks_channel: channel(),
+            //peers: Vec::new(),
+            blocks_channel: unbounded(),
+            shutdown_signal,
             network,
         }
     }
@@ -65,13 +69,18 @@ impl PeerManager {
         info!("got nodes to connect {:?}", ips);
 
         let current_tip = self.chain_manager.get_block_index_tip();
+        // let tip_height = current_tip.height();
+        // let hash = current_tip.block_hash().hash;
+        //
+        // info!("current tip height {:?}", current_tip.height());
+        // info!("current tip {:?}", current_tip.block_hash().hash);
 
         // sender can be cloned and passed to multiple peers
         // so each one can communicate new blocks
         // through the channel to the single receiver
         let block_sender = self.blocks_channel.0.clone();
 
-        let (tip_sender, tip_receiver) = channel();
+        let (tip_sender, tip_receiver) = unbounded();
 
         // spawn threads here to handle peer connections
         // only connect to ips[0] so just one peer for now. Eventually handle multiple
@@ -79,6 +88,8 @@ impl PeerManager {
         thread::spawn(move || {
             let mut peer = set_peer(
                 ips[0],
+                // tip_height,
+                // hash,
                 current_tip.height(),
                 current_tip.block_hash().hash,
                 block_sender,
@@ -97,27 +108,33 @@ impl PeerManager {
         // thread here to receive on blocks channel and pass them to chainstate
         // manager to be processed
         let _ = thread::spawn(move || {
-            self.chain_manager.import_blocks().unwrap();
             loop {
-                let block = self.blocks_channel.1.recv().unwrap();
-                let raw_block = consensus::encode::serialize(&block);
-                let kernel_block = bitcoinkernel::Block::try_from(raw_block.as_slice()).unwrap();
+                select! {
+                    recv(self.shutdown_signal) -> _ => {
+                        return;
+                    },
+                    recv(self.blocks_channel.1) -> msg => {
+                        //let block = self.blocks_channel.1.recv().unwrap();
+                        let block = msg.unwrap();
+                        let raw_block = consensus::encode::serialize(&block);
+                        let kernel_block = bitcoinkernel::Block::try_from(raw_block.as_slice()).unwrap();
 
-                info!("processing block {:?}", kernel_block.get_hash().hash);
+                        //info!("processing block {:?}", kernel_block.get_hash().hash);
 
-                // NOTE: according to comments in code from lib, first bool is if the block
-                // was valid and 2nd is if it's a new block or duplicate.
-                // if valid, update last block/height in peer
-                //let (b1, b2) = self.chain_manager.process_block(&block);
-                let (b1, b2) = self.chain_manager.process_block(&kernel_block);
-                if b1 && b2 {
-                    info!("block was valid and new one. Updating tip in peer.");
-                    let tip_idx = self.chain_manager.get_block_index_tip();
-                    info!("new height {:?}", tip_idx.height());
+                        // NOTE: according to comments in code from lib, first bool is if the block
+                        // was valid and 2nd is if it's a new block or duplicate.
+                        // if valid, update last block/height in peer
+                        let (b1, b2) = self.chain_manager.process_block(&kernel_block);
+                        if b1 && b2 {
+                            //info!("block was valid and new one. Updating tip in peer.");
+                            // info!("new height {:?}", tip_idx.height());
+                            let tip_idx = self.chain_manager.get_block_index_tip();
 
-                    tip_sender
-                        .send((tip_idx.height(), tip_idx.block_hash().hash))
-                        .unwrap();
+                            tip_sender
+                                .send((tip_idx.height(), tip_idx.block_hash().hash))
+                                .unwrap();
+                        }
+                    },
                 }
             }
         })
@@ -176,7 +193,7 @@ impl Peer {
         }
         info!("initial peer handshake complete!");
 
-        let send_channel = channel();
+        let send_channel = unbounded();
 
         info!("sending initial getblocks msg");
 
@@ -290,9 +307,9 @@ impl Peer {
         }
     }
 
-    fn process_message(&self, msg: RawNetworkMessage) -> Result<(), NodeError> {
-        unimplemented!()
-    }
+    // fn process_message(&self, _msg: RawNetworkMessage) -> Result<(), NodeError> {
+    //     unimplemented!()
+    // }
 
     // do initial handshake by exchanging version messages
     fn peer_handshake(&mut self) -> Result<(), NodeError> {
