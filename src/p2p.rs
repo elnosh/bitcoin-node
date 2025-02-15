@@ -17,12 +17,21 @@ use log::{error, info};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::error::NodeError;
+
+fn build_raw_network_msg(network: Network, msg: NetworkMessage) -> RawNetworkMessage {
+    let network_magic = match network {
+        Network::Signet => Magic::SIGNET,
+        Network::Bitcoin => Magic::BITCOIN,
+        _ => Magic::REGTEST,
+    };
+    RawNetworkMessage::new(network_magic, msg)
+}
 
 fn get_nodes(network: Network) -> Result<Vec<IpAddr>, NodeError> {
     let seed = match network {
@@ -38,8 +47,8 @@ fn get_nodes(network: Network) -> Result<Vec<IpAddr>, NodeError> {
 pub struct PeerManager {
     chain_manager: ChainstateManager,
     //peers: Vec<Peer>,
-    // receive new blocks on this channel. This should check if block was already seen
-    // if so, ignore. If not, process block by passing to ChainstateManager
+    // receive blocks on this channel. This should check if a block was already seen.
+    // If so, ignore. If not, process block by passing to ChainstateManager
     blocks_channel: (Sender<Block>, Receiver<Block>),
     shutdown_signal: Receiver<bool>,
     network: Network,
@@ -69,29 +78,24 @@ impl PeerManager {
         info!("got nodes to connect {:?}", ips);
 
         let current_tip = self.chain_manager.get_block_index_tip();
-        // let tip_height = current_tip.height();
-        // let hash = current_tip.block_hash().hash;
-        //
-        // info!("current tip height {:?}", current_tip.height());
-        // info!("current tip {:?}", current_tip.block_hash().hash);
 
         // sender can be cloned and passed to multiple peers
         // so each one can communicate new blocks
         // through the channel to the single receiver
         let block_sender = self.blocks_channel.0.clone();
 
+        // channel on which to communicate updated tip
         let (tip_sender, tip_receiver) = unbounded();
 
         // spawn threads here to handle peer connections
         // only connect to ips[0] so just one peer for now. Eventually handle multiple
         // connections
         thread::spawn(move || {
+            // TODO: properly terminate this thread on shutdown
+
             let mut peer = set_peer(
                 ips[0],
-                // tip_height,
-                // hash,
-                current_tip.height(),
-                current_tip.block_hash().hash,
+                (current_tip.height(), current_tip.block_hash().hash),
                 block_sender,
                 tip_receiver,
                 self.network,
@@ -114,25 +118,34 @@ impl PeerManager {
                         return;
                     },
                     recv(self.blocks_channel.1) -> msg => {
-                        //let block = self.blocks_channel.1.recv().unwrap();
-                        let block = msg.unwrap();
+                        let block = match msg {
+                            Ok(b) => b,
+                            Err(_) => {
+                                error!("terminating... channel disconnected");
+                                return;
+                            }
+                        };
+
                         let raw_block = consensus::encode::serialize(&block);
-                        let kernel_block = bitcoinkernel::Block::try_from(raw_block.as_slice()).unwrap();
+                        let kernel_block = match bitcoinkernel::Block::try_from(raw_block.as_slice()) {
+                            Ok(b) => b,
+                            Err(err) => {
+                                error!("invalid block {:?} ignoring for now", err);
+                                continue
+                            },
+                        };
 
-                        //info!("processing block {:?}", kernel_block.get_hash().hash);
-
-                        // NOTE: according to comments in code from lib, first bool is if the block
-                        // was valid and 2nd is if it's a new block or duplicate.
-                        // if valid, update last block/height in peer
+                        // NOTE: according to comments in code from lib, first bool is 
+                        // if the block was valid and 2nd is if it's a new block
+                        // if valid and not a duplicate, update last block/height in peer
                         let (b1, b2) = self.chain_manager.process_block(&kernel_block);
                         if b1 && b2 {
-                            //info!("block was valid and new one. Updating tip in peer.");
-                            // info!("new height {:?}", tip_idx.height());
                             let tip_idx = self.chain_manager.get_block_index_tip();
+                            info!("received new valid block. Updating to new tip height {} in peer", tip_idx.height());
 
-                            tip_sender
-                                .send((tip_idx.height(), tip_idx.block_hash().hash))
-                                .unwrap();
+                            if let Err(_) = tip_sender.send((tip_idx.height(), tip_idx.block_hash().hash)) {
+                                error!("could not send new tip on channel to peer");
+                            };
                         }
                     },
                 }
@@ -142,25 +155,25 @@ impl PeerManager {
     }
 }
 
+type BlockIndex = (i32, [u8; 32]);
+
 struct Peer {
     conn: Arc<TcpStream>,
-    height: i32,
-    last_block: [u8; 32],
-    // channel on which to send (block) data to peer manager
+    current_block: Arc<Mutex<BlockIndex>>,
+    // channel on which to send block data to peer manager
     blocks_channel: Sender<Block>,
     // this channel will receive updates on longest valid blockchain
     // from chainstate manager
-    tip: Receiver<(i32, [u8; 32])>,
+    tip: Receiver<BlockIndex>,
     network: Network,
     // - type of node
 }
 
 fn set_peer(
     ip: IpAddr,
-    height: i32,
-    last_block: [u8; 32],
+    current_block: BlockIndex,
     blocks_channel: Sender<Block>,
-    tip: Receiver<(i32, [u8; 32])>,
+    tip: Receiver<BlockIndex>,
     network: Network,
 ) -> Result<Peer, NodeError> {
     let port = match network {
@@ -172,8 +185,7 @@ fn set_peer(
     let conn = TcpStream::connect((ip, port)).unwrap();
     Ok(Peer {
         conn: Arc::new(conn),
-        height,
-        last_block,
+        current_block: Arc::new(Mutex::new(current_block)),
         blocks_channel,
         tip,
         network,
@@ -183,7 +195,7 @@ fn set_peer(
 impl Peer {
     // long running thread that will handle peer message exchange.
     // any received messages deemed worth communicating (like block data) should be sent to peer manager
-    // this method returns if an unrecoverable error happens like closed connection
+    // it returns if an unrecoverable error happens like closed connection
     // handshake error, etc.
     fn handle_peer_connection(&mut self) {
         // do handshake with peer first
@@ -193,20 +205,20 @@ impl Peer {
         }
         info!("initial peer handshake complete!");
 
-        let send_channel = unbounded();
+        // channel to communicate messages to be written on the tcp connection to peer
+        let tcp_comms_channel = unbounded();
 
         info!("sending initial getblocks msg");
 
         // send getblocks msg to kickoff process of getting missing block data
-        let block_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&self.last_block));
+        let block_hash =
+            BlockHash::from_raw_hash(*Hash::from_bytes_ref(&self.current_block.lock().unwrap().1));
         let stop_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
         let get_blocks_msg = GetBlocksMessage::new(vec![block_hash], stop_hash);
-        send_channel
+        tcp_comms_channel
             .0
             .send(self.build_raw_network_msg(NetworkMessage::GetBlocks(get_blocks_msg)))
             .unwrap();
-
-        let receiver = send_channel.1;
 
         let conn_clone = Arc::clone(&self.conn);
 
@@ -214,8 +226,46 @@ impl Peer {
         thread::spawn(move || {
             loop {
                 // TODO: REMOVE THESE UNWRAPS
-                let msg_to_send = receiver.recv().unwrap();
+                let msg_to_send = tcp_comms_channel.1.recv().unwrap();
                 msg_to_send.consensus_encode(&mut (&*conn_clone)).unwrap();
+            }
+        });
+
+        let tcp_send_clone = tcp_comms_channel.0.clone();
+        let tip_rec = self.tip.clone();
+        let current_block = Arc::clone(&self.current_block);
+        let network = self.network;
+
+        thread::spawn(move || {
+            loop {
+                let new_tip = tip_rec.recv();
+                if let Ok(new_tip) = new_tip {
+                    let mut current_block = current_block.lock().unwrap();
+                    info!(
+                        "received new tip on channel {}. CURRENT self.height is {}",
+                        new_tip.0, current_block.0
+                    );
+
+                    // using this number because the max number of blocks that are sent in response
+                    // to a getblocks msg is 500. This is only during IBD. Should change when already
+                    // synced.
+                    if current_block.0 + 495 < new_tip.0 {
+                        info!("updating latest height to send new getblocks msg");
+                        *current_block = (new_tip.0, new_tip.1);
+
+                        let block_hash =
+                            BlockHash::from_raw_hash(*Hash::from_bytes_ref(&current_block.1));
+
+                        let stop_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
+                        let get_blocks_msg = GetBlocksMessage::new(vec![block_hash], stop_hash);
+                        tcp_send_clone
+                            .send(build_raw_network_msg(
+                                network,
+                                NetworkMessage::GetBlocks(get_blocks_msg),
+                            ))
+                            .unwrap();
+                    }
+                };
             }
         });
 
@@ -226,30 +276,7 @@ impl Peer {
         //      - send this block data to peer mngr which then passes it to chainstate manager to process
         //      and validate block
         loop {
-            let new_tip = self.tip.try_recv();
-            if let Ok(new_tip) = new_tip {
-                let height = new_tip.0;
-                let block = new_tip.1;
-
-                if self.height + 495 < height {
-                    info!("updating latest height to send new getblocks msg");
-                    self.height = height;
-                    self.last_block = block;
-
-                    let block_hash =
-                        BlockHash::from_raw_hash(*Hash::from_bytes_ref(&self.last_block));
-                    let stop_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
-                    let get_blocks_msg = GetBlocksMessage::new(vec![block_hash], stop_hash);
-
-                    send_channel
-                        .0
-                        .send(self.build_raw_network_msg(NetworkMessage::GetBlocks(get_blocks_msg)))
-                        .unwrap();
-                }
-            };
-
             let network_msg = RawNetworkMessage::consensus_decode(&mut (&*self.conn));
-
             match network_msg {
                 Ok(raw_msg) => {
                     match raw_msg.payload() {
@@ -277,7 +304,7 @@ impl Peer {
                                 .collect();
 
                             let get_data_msg = NetworkMessage::GetData(inventory);
-                            send_channel
+                            tcp_comms_channel
                                 .0
                                 .send(self.build_raw_network_msg(get_data_msg))
                                 .unwrap();
@@ -306,10 +333,6 @@ impl Peer {
             }
         }
     }
-
-    // fn process_message(&self, _msg: RawNetworkMessage) -> Result<(), NodeError> {
-    //     unimplemented!()
-    // }
 
     // do initial handshake by exchanging version messages
     fn peer_handshake(&mut self) -> Result<(), NodeError> {
@@ -363,12 +386,7 @@ impl Peer {
     }
 
     fn build_raw_network_msg(&self, msg: NetworkMessage) -> RawNetworkMessage {
-        let network_magic = match self.network {
-            Network::Signet => Magic::SIGNET,
-            Network::Bitcoin => Magic::BITCOIN,
-            _ => Magic::REGTEST,
-        };
-        RawNetworkMessage::new(network_magic, msg)
+        build_raw_network_msg(self.network, msg)
     }
 
     fn build_version_msg(&self) -> VersionMessage {
@@ -388,7 +406,7 @@ impl Peer {
             // can set it to 0 for now since it will only do outbound connections
             0,
             "bitcoin-node".to_string(),
-            self.height,
+            self.current_block.lock().unwrap().0,
         )
     }
 }

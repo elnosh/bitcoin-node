@@ -51,7 +51,6 @@ fn main() {
     chain_manager.import_blocks().unwrap();
 
     let (shutdown_send, shutdown_receive) = bounded(1);
-
     ctrlc::set_handler(move || shutdown_send.send(true).unwrap()).unwrap();
 
     let peer_mngr = PeerManager::new(chain_manager, shutdown_receive, bitcoin::Network::Regtest);
