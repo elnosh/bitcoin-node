@@ -1,12 +1,13 @@
 use std::sync::{Arc, Once};
 
-use bitcoinkernel::{ChainstateManager, ChainstateManagerOptions, ContextBuilder, Log, Logger};
+use bitcoin::Network;
+use bitcoin_node::{network::BitcoinNetwork, p2p::PeerManager};
+use bitcoinkernel::{
+    ChainType, ChainstateManager, ChainstateManagerOptions, ContextBuilder, Log, Logger,
+};
+use clap::Parser;
 use crossbeam_channel::bounded;
 use log::info;
-use p2p::PeerManager;
-
-mod error;
-mod p2p;
 
 struct KernelLog {}
 
@@ -28,31 +29,38 @@ fn setup_logging() {
     unsafe { GLOBAL_LOG_CALLBACK_HOLDER = Some(Logger::new(KernelLog {}).unwrap()) };
 }
 
+#[derive(Parser)]
+#[command()]
+struct Cli {
+    #[arg(short, long, default_value = "regtest", value_enum)]
+    network: BitcoinNetwork,
+}
+
 fn main() {
     START.call_once(|| {
         setup_logging();
     });
 
+    let cli = Cli::parse();
+    let data_dir = format!(".bitcoin-node/{}", cli.network);
+    let blocks_dir = format!("{}/blocks", data_dir);
+
     let context = Arc::new(
         ContextBuilder::new()
-            .chain_type(bitcoinkernel::ChainType::REGTEST)
+            .chain_type(ChainType::from(cli.network))
             .build()
             .expect("unable to set context"),
     );
-
-    let data_dir = ".bitcoin-node";
-    let blocks_dir = format!("{}/blocks", data_dir);
 
     let chain_manager_options =
         ChainstateManagerOptions::new(&context, &data_dir, &blocks_dir).unwrap();
     let chain_manager =
         ChainstateManager::new(chain_manager_options, Arc::clone(&context)).unwrap();
-
     chain_manager.import_blocks().unwrap();
 
     let (shutdown_send, shutdown_receive) = bounded(1);
     ctrlc::set_handler(move || shutdown_send.send(true).unwrap()).unwrap();
 
-    let peer_mngr = PeerManager::new(chain_manager, shutdown_receive, bitcoin::Network::Regtest);
+    let peer_mngr = PeerManager::new(chain_manager, shutdown_receive, Network::from(cli.network));
     peer_mngr.run();
 }

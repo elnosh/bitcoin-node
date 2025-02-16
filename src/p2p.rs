@@ -24,20 +24,26 @@ use std::{
 
 use crate::error::NodeError;
 
-fn build_raw_network_msg(network: Network, msg: NetworkMessage) -> RawNetworkMessage {
+fn build_raw_network_msg(
+    network: Network,
+    msg: NetworkMessage,
+) -> Result<RawNetworkMessage, NodeError> {
     let network_magic = match network {
-        Network::Signet => Magic::SIGNET,
         Network::Bitcoin => Magic::BITCOIN,
-        _ => Magic::REGTEST,
+        Network::Testnet4 => Magic::TESTNET4,
+        Network::Signet => Magic::SIGNET,
+        Network::Regtest => Magic::REGTEST,
+        _ => return Err(NodeError::NetworkNotSupported),
     };
-    RawNetworkMessage::new(network_magic, msg)
+    Ok(RawNetworkMessage::new(network_magic, msg))
 }
 
 fn get_nodes(network: Network) -> Result<Vec<IpAddr>, NodeError> {
     let seed = match network {
-        Network::Regtest => return Ok(vec![IpAddr::from_str("127.0.0.1").unwrap()]),
-        Network::Signet => "seed.signet.bitcoin.sprovoost.nl.",
         Network::Bitcoin => "seed.bitcoin.sipa.be.",
+        Network::Testnet4 => "seed.testnet4.bitcoin.sprovoost.nl.",
+        Network::Signet => "seed.signet.bitcoin.sprovoost.nl.",
+        Network::Regtest => return Ok(vec![IpAddr::from_str("127.0.0.1").unwrap()]),
         _ => return Err(NodeError::NetworkNotSupported),
     };
     let ips: Vec<IpAddr> = lookup_host(seed).unwrap();
@@ -69,8 +75,8 @@ impl PeerManager {
         }
     }
 
-    // long running thread that will:
-    //      - maintain chain tip.
+    // long running method that will:
+    //      - connect to peers (just 1 for now)
     //      - receive block data in channel from peers
     //      - pass blocks to chainstate mgr to be validated.
     pub fn run(self) {
@@ -79,9 +85,7 @@ impl PeerManager {
 
         let current_tip = self.chain_manager.get_block_index_tip();
 
-        // sender can be cloned and passed to multiple peers
-        // so each one can communicate new blocks
-        // through the channel to the single receiver
+        // channel that will be used by peer struct to communicate new blocks
         let block_sender = self.blocks_channel.0.clone();
 
         // channel on which to communicate updated tip
@@ -104,7 +108,7 @@ impl PeerManager {
             info!("successfully connected to peer!");
             // handle_connection runs indefinitely and only returns if there was an error.
             // if there was error, it is logged there.
-            peer.handle_peer_connection();
+            peer.handle_connection();
             // remove peer since something went wrong in the connection
             error!("handle_connection returned. removing peer...");
         });
@@ -136,7 +140,7 @@ impl PeerManager {
                         };
 
                         // NOTE: according to comments in code from lib, first bool is 
-                        // if the block was valid and 2nd is if it's a new block
+                        // if the block was valid and 2nd is if it's a new block.
                         // if valid and not a duplicate, update last block/height in peer
                         let (b1, b2) = self.chain_manager.process_block(&kernel_block);
                         if b1 && b2 {
@@ -162,7 +166,7 @@ struct Peer {
     current_block: Arc<Mutex<BlockIndex>>,
     // channel on which to send block data to peer manager
     blocks_channel: Sender<Block>,
-    // this channel will receive updates on longest valid blockchain
+    // this channel will receive updates on longest valid chain
     // from chainstate manager
     tip: Receiver<BlockIndex>,
     network: Network,
@@ -177,9 +181,10 @@ fn set_peer(
     network: Network,
 ) -> Result<Peer, NodeError> {
     let port = match network {
-        Network::Regtest => 18444,
-        Network::Signet => 38333,
         Network::Bitcoin => 8333,
+        Network::Testnet4 => 18333,
+        Network::Signet => 38333,
+        Network::Regtest => 18444,
         _ => return Err(NodeError::NetworkNotSupported),
     };
     let conn = TcpStream::connect((ip, port)).unwrap();
@@ -193,11 +198,11 @@ fn set_peer(
 }
 
 impl Peer {
-    // long running thread that will handle peer message exchange.
+    // long running method that will handle peer message exchange.
     // any received messages deemed worth communicating (like block data) should be sent to peer manager
     // it returns if an unrecoverable error happens like closed connection
     // handshake error, etc.
-    fn handle_peer_connection(&mut self) {
+    fn handle_connection(&mut self) {
         // do handshake with peer first
         if let Some(err) = self.peer_handshake().err() {
             error!("error doing peer handshake {:?}", err);
@@ -217,7 +222,10 @@ impl Peer {
         let get_blocks_msg = GetBlocksMessage::new(vec![block_hash], stop_hash);
         tcp_comms_channel
             .0
-            .send(self.build_raw_network_msg(NetworkMessage::GetBlocks(get_blocks_msg)))
+            .send(
+                self.build_raw_network_msg(NetworkMessage::GetBlocks(get_blocks_msg))
+                    .unwrap(),
+            )
             .unwrap();
 
         let conn_clone = Arc::clone(&self.conn);
@@ -259,10 +267,13 @@ impl Peer {
                         let stop_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
                         let get_blocks_msg = GetBlocksMessage::new(vec![block_hash], stop_hash);
                         tcp_send_clone
-                            .send(build_raw_network_msg(
-                                network,
-                                NetworkMessage::GetBlocks(get_blocks_msg),
-                            ))
+                            .send(
+                                build_raw_network_msg(
+                                    network,
+                                    NetworkMessage::GetBlocks(get_blocks_msg),
+                                )
+                                .unwrap(),
+                            )
                             .unwrap();
                     }
                 };
@@ -306,7 +317,7 @@ impl Peer {
                             let get_data_msg = NetworkMessage::GetData(inventory);
                             tcp_comms_channel
                                 .0
-                                .send(self.build_raw_network_msg(get_data_msg))
+                                .send(self.build_raw_network_msg(get_data_msg).unwrap())
                                 .unwrap();
                         }
 
@@ -337,7 +348,7 @@ impl Peer {
     // do initial handshake by exchanging version messages
     fn peer_handshake(&mut self) -> Result<(), NodeError> {
         let version_msg =
-            self.build_raw_network_msg(NetworkMessage::Version(self.build_version_msg()));
+            self.build_raw_network_msg(NetworkMessage::Version(self.build_version_msg()))?;
 
         // send version msg
         version_msg
@@ -374,7 +385,7 @@ impl Peer {
         }
 
         // send verack to peer after receiving version msg
-        self.build_raw_network_msg(NetworkMessage::Verack)
+        self.build_raw_network_msg(NetworkMessage::Verack)?
             .consensus_encode(&mut (&*self.conn))
             .map_err(|e| {
                 NodeError::NetworkIO(format!("error sending verack msg to peer {:?}", e))
@@ -385,7 +396,7 @@ impl Peer {
         Ok(())
     }
 
-    fn build_raw_network_msg(&self, msg: NetworkMessage) -> RawNetworkMessage {
+    fn build_raw_network_msg(&self, msg: NetworkMessage) -> Result<RawNetworkMessage, NodeError> {
         build_raw_network_msg(self.network, msg)
     }
 
