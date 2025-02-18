@@ -1,4 +1,7 @@
-use std::sync::{Arc, Once};
+use std::{
+    process,
+    sync::{Arc, Once},
+};
 
 use bitcoin::Network;
 use bitcoin_node::{network::BitcoinNetwork, p2p::PeerManager};
@@ -36,7 +39,8 @@ struct Cli {
     network: BitcoinNetwork,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     START.call_once(|| {
         setup_logging();
     });
@@ -59,8 +63,12 @@ fn main() {
     chain_manager.import_blocks().unwrap();
 
     let (shutdown_send, shutdown_receive) = bounded(1);
-    ctrlc::set_handler(move || shutdown_send.send(true).unwrap()).unwrap();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        shutdown_send.send(true).unwrap();
+    });
 
     let peer_mngr = PeerManager::new(chain_manager, shutdown_receive, Network::from(cli.network));
-    peer_mngr.run();
+    peer_mngr.run().await;
+    process::exit(0);
 }
