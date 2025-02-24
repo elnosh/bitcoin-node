@@ -186,6 +186,7 @@ dependencies = [
  "dns-lookup",
  "env_logger",
  "log",
+ "redb",
  "serde",
  "serde_json",
  "tokio",
@@ -214,9 +215,9 @@ dependencies = [
 
 [[package]]
 name = "bitcoinkernel"
-version = "0.0.15"
+version = "0.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56171f58416cc2071a9037dc2f7aa2cb6d127dc49328acb0b948268239972298"
+checksum = "fd1567c20a7f62b898bf81a71832615992534d7781c6b2c8cf333905126bf00f"
 dependencies = [
  "libbitcoinkernel-sys",
 ]
@@ -480,9 +481,9 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
 name = "libbitcoinkernel-sys"
-version = "0.0.14"
+version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "297a18289261b983d38d4de15c1b15a06d73b76e3fbf3a3659eab71b136529c3"
+checksum = "b48f34c994c5ea6477c3804832ecbf909c7d1b25a721b0235a888153fc619d85"
 dependencies = [
  "bindgen",
  "cc",
@@ -685,6 +686,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom",
+]
+
+[[package]]
+name = "redb"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea0a72cd7140de9fc3e318823b883abf819c20d478ec89ce880466dc2ef263c6"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

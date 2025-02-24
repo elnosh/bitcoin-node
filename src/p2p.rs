@@ -1,16 +1,16 @@
 use bitcoin::{
+    block::Header,
     consensus::{self, encode::Error, Decodable},
     hashes::sha256d::Hash,
     io::{Cursor, ErrorKind},
     p2p::{
         message::{CommandString, NetworkMessage, RawNetworkMessage},
-        message_blockdata::{GetBlocksMessage, Inventory},
+        message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory},
         message_network::VersionMessage,
         Address, Magic, ServiceFlags,
     },
     Block, BlockHash, Network,
 };
-use bitcoinkernel::ChainstateManager;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use dns_lookup::lookup_host;
 use log::{error, info};
@@ -28,24 +28,41 @@ use tokio::{
     },
 };
 
-use crate::error::NodeError;
+use crate::{
+    error::NodeError,
+    node::{BlockIndex, Height, IBDState, SyncState},
+};
 
+#[derive(Clone)]
 pub struct PeerManager {
-    chain_manager: ChainstateManager,
-    //peers: Vec<Peer>,
+    sync_state: SyncState,
+    block_height: BlockIndex,
+    block_header_sender: Sender<Vec<Header>>,
+    block_sender: Sender<Block>,
+    sync_state_receiver: Receiver<SyncState>,
+    best_height_sender: Sender<Height>,
     shutdown_signal: crossbeam_channel::Receiver<bool>,
     network: Network,
 }
 
 impl PeerManager {
     pub fn new(
-        chain_manager: ChainstateManager,
+        sync_state: SyncState,
+        block_height: BlockIndex,
+        block_header_sender: Sender<Vec<Header>>,
+        block_sender: Sender<Block>,
+        sync_state_receiver: Receiver<SyncState>,
+        best_height_sender: Sender<Height>,
         shutdown_signal: crossbeam_channel::Receiver<bool>,
         network: Network,
     ) -> Self {
         PeerManager {
-            chain_manager,
-            //peers: Vec::new(),
+            sync_state,
+            block_height,
+            block_header_sender,
+            block_sender,
+            sync_state_receiver,
+            best_height_sender,
             shutdown_signal,
             network,
         }
@@ -59,26 +76,19 @@ impl PeerManager {
         let ips = get_nodes(self.network).unwrap();
         info!("got nodes to connect {:?}", ips);
 
-        let current_tip = self.chain_manager.get_block_index_tip();
-
-        // sender will be passed to peer and receive will listen for blocks received by the peer
-        // and pass them to be processed by the chainstate manager
-        let (block_send, block_receive) = unbounded();
-
-        // channel on which to communicate updated tip
-        let (tip_sender, tip_receiver) = unbounded();
-
         // task to handle peer connections.
         // only connects to ips[0] so just one peer for now. Eventually handle multiple
         // connections
         tokio::spawn(async move {
             // TODO: properly terminate this task on shutdown
-
             let mut peer = Peer::new(
                 ips[0],
-                (current_tip.height(), current_tip.block_hash().hash),
-                block_send,
-                tip_receiver,
+                self.sync_state,
+                self.block_height,
+                self.block_header_sender,
+                self.block_sender,
+                self.sync_state_receiver,
+                self.best_height_sender,
                 self.network,
             );
             // handle_connection runs indefinitely and only returns if there was an error.
@@ -88,68 +98,33 @@ impl PeerManager {
             error!("handle_connection returned. removing peer...");
         });
 
-        // receive on blocks channel and pass them to chainstate manager to be processed
-        loop {
-            crossbeam_channel::select! {
-                recv(self.shutdown_signal) -> _ => {
-                    break;
-                },
-                recv(block_receive) -> msg => {
-                    let block = match msg {
-                        Ok(b) => b,
-                        Err(_) => {
-                            error!("terminating... channel disconnected");
-                            break;
-                        }
-                    };
-
-                    let raw_block = consensus::encode::serialize(&block);
-                    let kernel_block = match bitcoinkernel::Block::try_from(raw_block.as_slice()) {
-                        Ok(b) => b,
-                        Err(err) => {
-                            error!("invalid block {:?} ignoring for now", err);
-                            continue
-                        },
-                    };
-
-                    // NOTE: according to comments in code from lib, first bool is
-                    // if the block was valid and 2nd is if it's a new block.
-                    // if valid and not a duplicate, update last block/height in peer
-                    let (b1, b2) = self.chain_manager.process_block(&kernel_block);
-                    if b1 && b2 {
-                        let tip_idx = self.chain_manager.get_block_index_tip();
-                        info!("received new valid block. Updating to new tip height {} in peer", tip_idx.height());
-
-                        if let Err(_) = tip_sender.send((tip_idx.height(), tip_idx.block_hash().hash)) {
-                            error!("could not send new tip on channel to peer");
-                        };
-                    }
-                },
-            }
-        }
         return;
     }
 }
 
-type BlockIndex = (i32, [u8; 32]);
-
 struct Peer {
     addr: (IpAddr, u16),
+    starting_sync_state: SyncState,
     current_block: Arc<Mutex<BlockIndex>>,
-    // channel on which to send block data to peer manager
+    // channels on which to send block data to peer manager
+    block_header_sender: Sender<Vec<Header>>,
     blocks_channel: Sender<Block>,
     // this channel will receive updates on longest valid chain
     // from chainstate manager
-    tip: Receiver<BlockIndex>,
+    sync_state_receiver: Receiver<SyncState>,
+    best_height_sender: Sender<Height>,
     network: Network,
 }
 
 impl Peer {
     fn new(
         ip: IpAddr,
+        starting_sync_state: SyncState,
         current_block: BlockIndex,
+        block_header_sender: Sender<Vec<Header>>,
         blocks_channel: Sender<Block>,
-        tip: Receiver<BlockIndex>,
+        sync_state_receiver: Receiver<SyncState>,
+        best_height_sender: Sender<Height>,
         network: Network,
     ) -> Peer {
         let port = match network {
@@ -161,9 +136,12 @@ impl Peer {
         };
         Peer {
             addr: (ip, port),
+            starting_sync_state,
             current_block: Arc::new(Mutex::new(current_block)),
+            block_header_sender,
             blocks_channel,
-            tip,
+            sync_state_receiver,
+            best_height_sender,
             network,
         }
     }
@@ -200,19 +178,41 @@ impl Peer {
         // channel to communicate messages to be written on the tcp connection to peer
         let tcp_comms_channel = unbounded();
 
-        info!("sending initial getblocks msg");
+        match self.starting_sync_state {
+            // if we are in header sync, send getheaders msg
+            SyncState::IBD(IBDState::HeaderSync) => {
+                info!("doing header synchronization");
+                let block_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(
+                    &self.current_block.lock().unwrap().1,
+                ));
+                let stop_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
+                let get_headers_msg = GetHeadersMessage::new(vec![block_hash], stop_hash);
+                if let Err(_) = tcp_comms_channel.0.send(
+                    self.build_raw_network_msg(NetworkMessage::GetHeaders(get_headers_msg))
+                        .unwrap(),
+                ) {
+                    error!("closing connection");
+                    return;
+                }
+            }
+            _ => {
+                info!("sending initial getblocks msg");
 
-        // send getblocks msg to kickoff process of getting missing block data
-        let block_hash =
-            BlockHash::from_raw_hash(*Hash::from_bytes_ref(&self.current_block.lock().unwrap().1));
-        let stop_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
-        let get_blocks_msg = GetBlocksMessage::new(vec![block_hash], stop_hash);
-        if let Err(_) = tcp_comms_channel.0.send(
-            self.build_raw_network_msg(NetworkMessage::GetBlocks(get_blocks_msg))
-                .unwrap(),
-        ) {
-            error!("closing connection");
-            return;
+                // if headers sync was finished, starts asking for block data
+                // send getblocks msg to kickoff process of getting missing block data
+                let block_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(
+                    &self.current_block.lock().unwrap().1,
+                ));
+                let stop_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
+                let get_blocks_msg = GetBlocksMessage::new(vec![block_hash], stop_hash);
+                if let Err(_) = tcp_comms_channel.0.send(
+                    self.build_raw_network_msg(NetworkMessage::GetBlocks(get_blocks_msg))
+                        .unwrap(),
+                ) {
+                    error!("closing connection");
+                    return;
+                }
+            }
         }
 
         let tcp_recv = tcp_comms_channel.1.clone();
@@ -226,32 +226,39 @@ impl Peer {
         });
 
         let tcp_send_clone = tcp_comms_channel.0.clone();
-        let tip_rec = self.tip.clone();
         let current_block = Arc::clone(&self.current_block);
         let network = self.network;
+        let sync_state_receiver = self.sync_state_receiver.clone();
 
         tokio::spawn(async move {
             loop {
-                let new_tip = tip_rec.recv();
-                if let Ok(new_tip) = new_tip {
-                    let mut current_block = current_block.lock().unwrap();
+                let new_sync_state = sync_state_receiver.recv().unwrap();
+
+                let mut block_idx: Option<BlockIndex> = None;
+                let in_block_sync_start = match &new_sync_state {
+                    SyncState::IBD(IBDState::BlockSync(idx)) => {
+                        block_idx = Some(*idx);
+                        true
+                    }
+                    SyncState::InSync(idx) => {
+                        block_idx = Some(*idx);
+                        false
+                    }
+                    _ => false,
+                };
+
+                if let Some(idx) = block_idx {
                     info!(
-                        "received new tip on channel {}. CURRENT self.height is {}",
-                        new_tip.0, current_block.0
+                        "received new sync state. There is new tip at height {}",
+                        idx.0
                     );
+                    let mut current_block = current_block.lock().unwrap();
 
-                    // using this number because the max number of blocks that are sent in response
-                    // to a getblocks msg is 500. This is only during IBD. Should change when already
-                    // synced.
-                    if current_block.0 + 495 < new_tip.0 {
-                        info!("updating latest height to send new getblocks msg");
-                        *current_block = (new_tip.0, new_tip.1);
+                    let block_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&idx.1));
+                    let stop_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
+                    let get_blocks_msg = GetBlocksMessage::new(vec![block_hash], stop_hash);
 
-                        let block_hash =
-                            BlockHash::from_raw_hash(*Hash::from_bytes_ref(&current_block.1));
-
-                        let stop_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
-                        let get_blocks_msg = GetBlocksMessage::new(vec![block_hash], stop_hash);
+                    if in_block_sync_start {
                         tcp_send_clone
                             .send(
                                 build_raw_network_msg(
@@ -261,17 +268,34 @@ impl Peer {
                                 .unwrap(),
                             )
                             .unwrap();
+                    } else {
+                        // using this number because the max number of blocks that are sent in response
+                        // to a getblocks msg is 500. This is only during IBD. Should change when already
+                        // synced.
+                        if current_block.0 + 495 < idx.0 {
+                            *current_block = (idx.0, idx.1);
+                            info!("updating latest height to send new getblocks msg");
+                            tcp_send_clone
+                                .send(
+                                    build_raw_network_msg(
+                                        network,
+                                        NetworkMessage::GetBlocks(get_blocks_msg),
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap();
+                        }
                     }
                 };
             }
         });
 
-        // - start asking for blockchain data:
-        //      - send getblocks message
+        // - read messages from peer:
         //      - receive inv message with list of blocks
         //      - send getdata to get blocks. Blocks received are full blocks with tx data
-        //      - send this block data to peer mngr which then passes it to chainstate manager to process
+        //      - send this block data to `Node` which then passes it to chainstate manager to process
         //      and validate block
+        //      - pass block headers to be validated during headers sync
         loop {
             let network_msg = read_network_msg(&mut conn_reader).await;
             match network_msg {
@@ -308,10 +332,34 @@ impl Peer {
                         }
 
                         NetworkMessage::Block(block) => {
-                            info!(
-                                "received new block, sending to chainstate manager to be processed"
-                            );
                             self.blocks_channel.send(block.clone()).unwrap();
+                        }
+                        NetworkMessage::Headers(headers) => {
+                            let headers = headers.to_vec();
+
+                            if headers.len() > 0 {
+                                let last_header_received = headers.last().unwrap().block_hash();
+
+                                self.block_header_sender.send(headers).unwrap();
+
+                                // TODO: do not ask for next batch of headers like this.
+                                let block_hash = BlockHash::from_raw_hash(*Hash::from_bytes_ref(
+                                    last_header_received.as_ref(),
+                                ));
+                                let stop_hash =
+                                    BlockHash::from_raw_hash(*Hash::from_bytes_ref(&[0; 32]));
+                                let get_headers_msg =
+                                    GetHeadersMessage::new(vec![block_hash], stop_hash);
+                                if let Err(_) = tcp_comms_channel.0.send(
+                                    self.build_raw_network_msg(NetworkMessage::GetHeaders(
+                                        get_headers_msg,
+                                    ))
+                                    .unwrap(),
+                                ) {
+                                    error!("closing connection");
+                                    return;
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -363,10 +411,18 @@ impl Peer {
             match network_msg.payload() {
                 NetworkMessage::Verack => verack_received = true,
                 // not verifying anything in the version msg right now
-                // TODO: should read 'start_height' field to know the height
-                // at which this peer is up to date. For now assuming that peer would be up to
-                // date with the longest valid chain
-                NetworkMessage::Version(_) => version_received = true,
+                // assuming that peer would be up to date with the longest valid chain
+                NetworkMessage::Version(version_msg) => {
+                    version_received = true;
+                    match self.starting_sync_state {
+                        // only send best height if in header sync
+                        SyncState::IBD(IBDState::HeaderSync) => {
+                            let peer_height = version_msg.start_height;
+                            self.best_height_sender.send(peer_height).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
                 // ignore other messages during handshake. This is most likely not ideal
                 _ => (),
             }
@@ -407,7 +463,7 @@ async fn read_network_msg(reader: &mut OwnedReadHalf) -> Result<RawNetworkMessag
     // - command (12 bytes)
     // - payload length (4 bytes)
     // - checksum (4 bytes)
-    // with payload length then it knows how many bytes to read for the actual
+    // with payload length then we know how many bytes to read for the actual
     // contents of the msg
     let mut buf = vec![0_u8; 24];
     reader.read_exact(&mut buf).await?;
