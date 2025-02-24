@@ -1,13 +1,7 @@
-use std::{
-    process,
-    sync::{Arc, Once},
-};
+use std::{process, sync::Once};
 
-use bitcoin::Network;
-use bitcoin_node::{network::BitcoinNetwork, p2p::PeerManager};
-use bitcoinkernel::{
-    ChainType, ChainstateManager, ChainstateManagerOptions, ContextBuilder, Log, Logger,
-};
+use bitcoin_node::{network::BitcoinNetwork, node::Node};
+use bitcoinkernel::{Log, Logger};
 use clap::Parser;
 use crossbeam_channel::bounded;
 use log::info;
@@ -46,21 +40,6 @@ async fn main() {
     });
 
     let cli = Cli::parse();
-    let data_dir = format!(".bitcoin-node/{}", cli.network);
-    let blocks_dir = format!("{}/blocks", data_dir);
-
-    let context = Arc::new(
-        ContextBuilder::new()
-            .chain_type(ChainType::from(cli.network))
-            .build()
-            .expect("unable to set context"),
-    );
-
-    let chain_manager_options =
-        ChainstateManagerOptions::new(&context, &data_dir, &blocks_dir).unwrap();
-    let chain_manager =
-        ChainstateManager::new(chain_manager_options, Arc::clone(&context)).unwrap();
-    chain_manager.import_blocks().unwrap();
 
     let (shutdown_send, shutdown_receive) = bounded(1);
     tokio::spawn(async move {
@@ -68,7 +47,7 @@ async fn main() {
         shutdown_send.send(true).unwrap();
     });
 
-    let peer_mngr = PeerManager::new(chain_manager, shutdown_receive, Network::from(cli.network));
-    peer_mngr.run().await;
+    let node = Node::new(".bitcoin-node", cli.network, shutdown_receive).unwrap();
+    node.run().await;
     process::exit(0);
 }
