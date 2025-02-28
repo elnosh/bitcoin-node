@@ -3,8 +3,8 @@ use std::{process, sync::Once};
 use bitcoin_node::{network::BitcoinNetwork, node::Node};
 use bitcoinkernel::{Log, Logger};
 use clap::Parser;
-use crossbeam_channel::bounded;
 use log::info;
+use tokio::sync::watch;
 
 struct KernelLog {}
 
@@ -41,13 +41,14 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    let (shutdown_send, shutdown_receive) = bounded(1);
+    let shutdown_signal = watch::channel(false);
+    let shutdown_send = shutdown_signal.0.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.unwrap();
         shutdown_send.send(true).unwrap();
     });
 
-    let node = Node::new(".bitcoin-node", cli.network, shutdown_receive).unwrap();
+    let node = Node::new(".bitcoin-node", cli.network, shutdown_signal).unwrap();
     node.run().await;
     process::exit(0);
 }
