@@ -1,15 +1,12 @@
 use bitcoin::{
-    block::Header,
-    consensus::{self, encode::Error, Decodable},
-    hashes::Hash,
-    io::{Cursor, ErrorKind},
+    consensus::{self, Decodable},
+    io::Cursor,
     p2p::{
         message::{CommandString, NetworkMessage, RawNetworkMessage},
-        message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory},
         message_network::VersionMessage,
         Address, Magic, ServiceFlags,
     },
-    Block, BlockHash, Network,
+    Network,
 };
 use dns_lookup::lookup_host;
 use log::{error, info};
@@ -26,45 +23,38 @@ use tokio::{
         TcpStream,
     },
     sync::{
-        broadcast::{Receiver as BroadcastReceiver, Sender as BroadcastSender},
-        mpsc::{self, Sender},
+        broadcast::{Receiver, Sender},
         watch::Receiver as WatchReceiver,
     },
 };
 
-use crate::{
-    error::NodeError,
-    node::{BlockIndex, Height, IBDState, SyncState},
-};
+use crate::{error::NodeError, node::BlockIndex};
 pub struct PeerManager {
-    starting_sync_state: SyncState,
     block_height: BlockIndex,
-    block_header_sender: Sender<Vec<Header>>,
-    block_sender: Sender<Block>,
-    sync_state_channel: (BroadcastSender<SyncState>, BroadcastReceiver<SyncState>),
-    best_height_sender: Sender<Height>,
+    // receiver will receive messages that the node wants written on the connection
+    // NOTE: only the receiver portion of the channel should be used but
+    // the receiver alone can't be cloned and need to clone them since each peer needs one.
+    // only way to create another receiver is from the sender.
+    tcp_conn_channel: (Sender<RawNetworkMessage>, Receiver<RawNetworkMessage>),
+    // channel for peer manager to send back messages it received on tcp connection
+    // to node for processing
+    msg_sender: Sender<RawNetworkMessage>,
     shutdown_signal: WatchReceiver<bool>,
     network: Network,
 }
 
 impl PeerManager {
     pub fn new(
-        starting_sync_state: SyncState,
         block_height: BlockIndex,
-        block_header_sender: Sender<Vec<Header>>,
-        block_sender: Sender<Block>,
-        sync_state_channel: (BroadcastSender<SyncState>, BroadcastReceiver<SyncState>),
-        best_height_sender: Sender<Height>,
+        tcp_conn_channel: (Sender<RawNetworkMessage>, Receiver<RawNetworkMessage>),
+        msg_sender: Sender<RawNetworkMessage>,
         shutdown_signal: WatchReceiver<bool>,
         network: Network,
     ) -> Self {
         PeerManager {
-            starting_sync_state,
             block_height,
-            block_header_sender,
-            block_sender,
-            sync_state_channel,
-            best_height_sender,
+            tcp_conn_channel,
+            msg_sender,
             shutdown_signal,
             network,
         }
@@ -78,13 +68,11 @@ impl PeerManager {
         let ips = get_nodes(&self.network).unwrap();
         info!("got nodes to connect {:?}", ips);
 
-        let starting_state = self.starting_sync_state.clone();
-        let block_height = self.block_height;
-        let block_header_sender = self.block_header_sender.clone();
-        let block_sender = self.block_sender.clone();
-        let sync_channel = self.sync_state_channel.0.clone();
-        let sync_state_receiver = sync_channel.subscribe();
-        let best_height = self.best_height_sender.clone();
+        let block_height = self.block_height.clone();
+        let tcp_conn_sender = self.tcp_conn_channel.0.clone();
+        let tcp_conn_receiver = tcp_conn_sender.subscribe();
+
+        let msg_sender = self.msg_sender.clone();
         let shutdown_signal = self.shutdown_signal.clone();
         let network = self.network;
 
@@ -94,12 +82,8 @@ impl PeerManager {
         tokio::spawn(async move {
             let peer = Peer::new(
                 ips[0],
-                starting_state,
                 block_height,
-                block_header_sender,
-                block_sender,
-                sync_state_receiver,
-                best_height,
+                (msg_sender, tcp_conn_receiver),
                 shutdown_signal,
                 network,
             );
@@ -116,15 +100,10 @@ impl PeerManager {
 
 struct Peer {
     addr: (IpAddr, u16),
-    starting_sync_state: SyncState,
     current_block: Arc<Mutex<BlockIndex>>,
-    // channels on which to send block data to peer manager
-    block_header_sender: Sender<Vec<Header>>,
-    blocks_channel: Sender<Block>,
-    // this channel will receive updates on longest valid chain
-    // from chainstate manager
-    sync_state_receiver: BroadcastReceiver<SyncState>,
-    best_height_sender: Sender<Height>,
+    // sender used to communicate messages it received on the connection back to the node
+    // received used to receive messages that the node wants written in the connection
+    tcp_conn_channel: (Sender<RawNetworkMessage>, Receiver<RawNetworkMessage>),
     shutdown_signal: WatchReceiver<bool>,
     network: Network,
 }
@@ -132,12 +111,8 @@ struct Peer {
 impl Peer {
     fn new(
         ip: IpAddr,
-        starting_sync_state: SyncState,
         current_block: BlockIndex,
-        block_header_sender: Sender<Vec<Header>>,
-        blocks_channel: Sender<Block>,
-        sync_state_receiver: BroadcastReceiver<SyncState>,
-        best_height_sender: Sender<Height>,
+        tcp_conn_channel: (Sender<RawNetworkMessage>, Receiver<RawNetworkMessage>),
         shutdown_signal: WatchReceiver<bool>,
         network: Network,
     ) -> Peer {
@@ -150,12 +125,8 @@ impl Peer {
         };
         Peer {
             addr: (ip, port),
-            starting_sync_state,
             current_block: Arc::new(Mutex::new(current_block)),
-            block_header_sender,
-            blocks_channel,
-            sync_state_receiver,
-            best_height_sender,
+            tcp_conn_channel,
             shutdown_signal,
             network,
         }
@@ -190,51 +161,8 @@ impl Peer {
 
         info!("initial peer handshake complete");
 
-        // channel to communicate messages to be written on the tcp connection to peer
-        //let (tcp_comms_send, tcp_comms_recv) = unbounded();
-        let (tcp_comms_send, mut tcp_comms_recv) = mpsc::unbounded_channel();
-
-        match self.starting_sync_state {
-            // if we are in header sync, send getheaders msg
-            SyncState::IBD(IBDState::HeaderSync) => {
-                let block_hash = BlockHash::from_byte_array(self.current_block.lock().unwrap().1);
-                let get_headers_msg =
-                    GetHeadersMessage::new(vec![block_hash], BlockHash::from_byte_array([0; 32]));
-                if let Err(_) = tcp_comms_send.send(
-                    self.build_raw_network_msg(NetworkMessage::GetHeaders(get_headers_msg))
-                        .unwrap(),
-                ) {
-                    error!("closing connection");
-                    return;
-                }
-                info!("sent getheaders msg");
-            }
-            _ => {
-                let current_block = self.current_block.lock().unwrap();
-                info!(
-                    "header sync is done. starting to ask blocks from height {}",
-                    current_block.0
-                );
-
-                // if headers sync was finished, starts asking for block data
-                // send getblocks msg to kickoff process of getting missing block data
-                //let block_hash = BlockHash::from_byte_array(self.current_block.lock().unwrap().1);
-                let block_hash = BlockHash::from_byte_array(current_block.1);
-                let get_blocks_msg =
-                    GetBlocksMessage::new(vec![block_hash], BlockHash::from_byte_array([0; 32]));
-                if let Err(_) = tcp_comms_send.send(
-                    self.build_raw_network_msg(NetworkMessage::GetBlocks(get_blocks_msg))
-                        .unwrap(),
-                ) {
-                    error!("closing connection");
-                    return;
-                }
-            }
-        }
-
         let mut shutdown_1 = self.shutdown_signal.clone();
         let mut shutdown_2 = self.shutdown_signal.clone();
-        let mut shutdown_3 = self.shutdown_signal.clone();
         // write on a different task
         tokio::spawn(async move {
             loop {
@@ -243,74 +171,16 @@ impl Peer {
                         info!("shutting down writer");
                         break;
                     }
-                    msg_to_send = tcp_comms_recv.recv() => {
-                        let msg_to_send = consensus::serialize(&msg_to_send.unwrap());
+                    msg_to_send = self.tcp_conn_channel.1.recv() => {
+                        let msg_to_send = msg_to_send.unwrap();
+                        let msg_to_send = consensus::serialize(&msg_to_send);
                         conn_writer.write_all(&msg_to_send).await.unwrap();
                     }
-
                 }
             }
         });
 
-        let tcp_send_clone = tcp_comms_send.clone();
-        let current_block = Arc::clone(&self.current_block);
-        let network = self.network;
-        let mut sync_state_recv = self.sync_state_receiver;
-
-        // this task will listen for any new sync state changes and ask
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown_2.changed() => {
-                        info!("shutting down new sync state listener");
-                        break;
-                    }
-
-                    new_sync_state = sync_state_recv.recv() => {
-                        let new_sync_state = new_sync_state.unwrap();
-                        let mut block_idx: Option<BlockIndex> = None;
-                        let in_block_sync_start = match &new_sync_state {
-                            SyncState::IBD(IBDState::BlockSync(idx)) => {
-                                block_idx = Some(*idx);
-                                true
-                            }
-                            SyncState::InSync(idx) => {
-                                block_idx = Some(*idx);
-                                false
-                            }
-                            _ => false,
-                        };
-
-                        if let Some(idx) = block_idx {
-                            info!(
-                                "received new sync state. There is new tip at height {}",
-                                idx.0
-                            );
-                            let mut current_block = current_block.lock().unwrap();
-
-                            let block_hash = BlockHash::from_byte_array(idx.1);
-                            let stop_hash = BlockHash::from_byte_array([0; 32]);
-                            let get_blocks_msg = NetworkMessage::GetBlocks(GetBlocksMessage::new(
-                                vec![block_hash],
-                                stop_hash,
-                            ));
-                            let msg_to_send = build_raw_network_msg(network, get_blocks_msg).unwrap();
-
-                            if in_block_sync_start {
-                                tcp_send_clone.send(msg_to_send).unwrap();
-                            } else {
-                                if current_block.0 + 495 < idx.0 {
-                                    *current_block = (idx.0, idx.1);
-                                    tcp_send_clone.send(msg_to_send).unwrap();
-                                }
-                            }
-                        };
-                    }
-                }
-            }
-        });
-
-        let tcp_send_clone = tcp_comms_send.clone();
+        let tcp_comms_send = self.tcp_conn_channel.0.clone();
         // - read messages from peer:
         //      - receive inv message with list of blocks
         //      - send getdata to get blocks. Blocks received are full blocks with tx data
@@ -319,91 +189,15 @@ impl Peer {
         //      - pass block headers to be validated during headers sync
         loop {
             tokio::select! {
-                _ = shutdown_3.changed() => {
+                _ = shutdown_2.changed() => {
                     info!("shutting msg reader");
                     break;
                 }
 
                 network_msg = read_network_msg(&mut conn_reader) => {
-                    match network_msg {
-                        Ok(raw_msg) => {
-                            match raw_msg.payload() {
-                                // on inv msg "MSG_BLOCK", send getdata msg to get full blocks
-                                NetworkMessage::Inv(inv) => {
-                                    // NOTE: getting everything from inventory. Eventually should first
-                                    // check if needed and then only ask for what's needed
-                                    info!("received 'inv' msg. Sending getdata");
-
-                                    // only handling "MSG_BLOCK" for now. Items in the Inventory vector
-                                    // will be "MSG_BLOCK" but when sending "getdata" msg to get those
-                                    // blocks, need to change items from "MSG_BLOCK" to "MSG_WITNESS_BLOCK"
-                                    // to get hash of blocks with witness data according to BIP-144.
-                                    let block_hashes: Vec<bitcoin::BlockHash> = inv
-                                        .iter()
-                                        .filter_map(|inv| match inv {
-                                            Inventory::Block(hash) => Some(*hash),
-                                            _ => None,
-                                        })
-                                        .collect();
-
-                                    let inventory: Vec<Inventory> = block_hashes
-                                        .into_iter()
-                                        .map(|hash| Inventory::WitnessBlock(hash.clone()))
-                                        .collect();
-
-                                    let get_data_msg = NetworkMessage::GetData(inventory);
-                                    tcp_send_clone
-                                        .send(build_raw_network_msg(network, get_data_msg).unwrap())
-                                        .unwrap();
-                                }
-
-                                NetworkMessage::Block(block) => {
-                                    info!("received new block");
-                                    self.blocks_channel.send(block.clone()).await.unwrap();
-                                }
-                                NetworkMessage::Headers(headers) => {
-                                    let headers = headers.to_vec();
-
-                                    if headers.len() > 0 {
-                                        let last_header_received = headers.last().unwrap().block_hash();
-                                        self.block_header_sender.send(headers).await.unwrap();
-
-                                        // TODO: do not ask for next batch of headers like this.
-                                        let get_headers_msg = GetHeadersMessage::new(
-                                            vec![last_header_received],
-                                            BlockHash::from_byte_array([0; 32]),
-                                        );
-                                        if let Err(_) = tcp_send_clone.send(
-                                            build_raw_network_msg(
-                                                network,
-                                                NetworkMessage::GetHeaders(get_headers_msg),
-                                            )
-                                            .unwrap(),
-                                        ) {
-                                            error!("closing connection");
-                                            return;
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        Err(err) => {
-                            // TODO: detect connection closes
-                            if let NodeError::BitcoinConsensusError(Error::Io(io_err)) = err {
-                                match io_err.kind() {
-                                    // here need to detect a closed connection. If connection got closed, return
-                                    // from this method. If non fatal error in connection, ignore and try to read
-                                    // next message
-                                    ErrorKind::ConnectionAborted => {
-                                        error!("connection to peer got closed.");
-                                        return ();
-                                    }
-                                    _ => continue,
-                                }
-                            }
-                        }
-                    }
+                    // pass read message from connection to node
+                    let network_msg = network_msg.unwrap();
+                    tcp_comms_send.send(network_msg).unwrap();
                 }
             }
         }
@@ -436,18 +230,9 @@ impl Peer {
             let network_msg = read_network_msg(reader).await?;
             match network_msg.payload() {
                 NetworkMessage::Verack => verack_received = true,
-                // not verifying anything in the version msg right now
-                // assuming that peer would be up to date with the longest valid chain
-                NetworkMessage::Version(version_msg) => {
+                NetworkMessage::Version(_) => {
                     version_received = true;
-                    match self.starting_sync_state {
-                        // only send best height if in header sync
-                        SyncState::IBD(IBDState::HeaderSync) => {
-                            let peer_height = version_msg.start_height;
-                            self.best_height_sender.send(peer_height).await.unwrap();
-                        }
-                        _ => {}
-                    }
+                    self.tcp_conn_channel.0.send(network_msg).unwrap();
                 }
                 // ignore other messages during handshake. This is most likely not ideal
                 _ => (),
@@ -459,15 +244,14 @@ impl Peer {
         }
 
         // send verack to peer after receiving version msg
-        let verack_msg = consensus::serialize(&self.build_raw_network_msg(NetworkMessage::Verack)?);
+        let verack_msg = consensus::serialize(&build_raw_network_msg(
+            self.network,
+            NetworkMessage::Verack,
+        )?);
         writer.write_all(&verack_msg).await?;
         info!("sent verack msg to peer");
 
         Ok(())
-    }
-
-    fn build_raw_network_msg(&self, msg: NetworkMessage) -> Result<RawNetworkMessage, NodeError> {
-        build_raw_network_msg(self.network, msg)
     }
 }
 
@@ -512,7 +296,7 @@ async fn read_network_msg(reader: &mut OwnedReadHalf) -> Result<RawNetworkMessag
     Ok(network_msg)
 }
 
-fn build_raw_network_msg(
+pub fn build_raw_network_msg(
     network: Network,
     msg: NetworkMessage,
 ) -> Result<RawNetworkMessage, NodeError> {

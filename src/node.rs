@@ -1,27 +1,33 @@
-use std::{collections::HashMap, fs, sync::Arc};
+use std::{fs, sync::Arc};
 
 use bitcoin::{
-    block::Header, consensus, constants::genesis_block, hashes::Hash, params::Params, Block,
+    consensus,
+    hashes::Hash,
+    p2p::{
+        message::{NetworkMessage, RawNetworkMessage},
+        message_blockdata::{GetHeadersMessage, Inventory},
+    },
     BlockHash, Network,
 };
 use bitcoinkernel::{ChainType, ChainstateManager, ChainstateManagerOptions, ContextBuilder};
-use log::{error, info};
-use redb::{Database, ReadOnlyTable, ReadableTable, TableDefinition};
+use log::info;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
-    broadcast::{self, Receiver as BroadcastReceiver, Sender as BroadcastSender},
-    mpsc::{self, Receiver},
+    broadcast::{self, Receiver, Sender},
     watch::{Receiver as WatchReceiver, Sender as WatchSender},
     Mutex,
 };
 
-use crate::{error::NodeError, network::BitcoinNetwork, p2p::PeerManager};
+use crate::{
+    error::NodeError,
+    header_chain::HeadersChain,
+    network::BitcoinNetwork,
+    p2p::{build_raw_network_msg, PeerManager},
+};
 
-const HEADER_TIP_KEY: &str = "header_tip";
-const HEADER_TIP_TABLE: TableDefinition<&str, i32> = TableDefinition::new("header_tip");
-const HEADER_CHAIN_TABLE: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("header_tree");
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockIndex(pub i32, pub [u8; 32]);
 
-pub type BlockIndex = (i32, [u8; 32]);
 pub type Height = i32;
 
 #[derive(Clone)]
@@ -32,54 +38,26 @@ pub enum SyncState {
 
 #[derive(Clone)]
 pub enum IBDState {
-    HeaderSync,
+    HeaderSync(HeaderSyncState),
     BlockSync(BlockIndex),
 }
 
+#[derive(Clone, Default)]
+pub struct HeaderSyncState {
+    target_height: i32,
+    current_sync_height: i32,
+}
+
 pub struct Node {
-    db: Database,
     sync_state: SyncState,
-    headers_chain: HashMap<BlockHash, BlockHeader>,
+    headers_chain: HeadersChain,
     peer_manager: Arc<Mutex<PeerManager>>,
     chain_manager: ChainstateManager,
-    block_header_receiver: Receiver<Vec<Header>>,
-    block_receiver: Receiver<Block>,
-    sync_state_channel: (BroadcastSender<SyncState>, BroadcastReceiver<SyncState>),
-    peer_height: Receiver<Height>,
+    // channel on which to send raw message that Peer struct should send on the connection
+    // and receive messages that were read from the connection
+    tcp_conn_channel: (Sender<RawNetworkMessage>, Receiver<RawNetworkMessage>),
     shutdown_signal: (WatchSender<bool>, WatchReceiver<bool>),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct BlockHeader {
-    block_hash: BlockHash,
-    previous_block: BlockHash,
-    merkle_root: [u8; 32],
-    time: u32,
-    nonce: u32,
-    next_block: Option<NextBlock>,
-    height: Height,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum NextBlock {
-    // Nodes in the chain should only point to one next block
-    Chain(BlockHash),
-    // if we are at the tip there could be forks and hence multiple next blocks
-    Tip(Vec<BlockHash>),
-}
-
-impl BlockHeader {
-    fn from_bitcoin_header(header: Header, height: Height) -> Self {
-        BlockHeader {
-            block_hash: header.block_hash(),
-            previous_block: header.prev_blockhash,
-            merkle_root: *header.merkle_root.as_ref(),
-            time: header.time,
-            nonce: header.nonce,
-            next_block: None,
-            height,
-        }
-    }
+    network: Network,
 }
 
 impl Node {
@@ -94,7 +72,6 @@ impl Node {
         info!("data dir {}", data_dir);
 
         fs::create_dir_all(&data_dir)?;
-        let db = Database::create(format!("{}/header", data_dir))?;
 
         let context = Arc::new(
             ContextBuilder::new()
@@ -107,116 +84,66 @@ impl Node {
         let chain_manager = ChainstateManager::new(chain_manager_options, Arc::clone(&context))?;
         chain_manager.import_blocks()?;
 
-        let read_txn = db.begin_read()?;
-        let sync_state = match read_txn.open_table(HEADER_TIP_TABLE) {
-            Ok(table) => {
-                // if HEADER_TIP_TABLE exists with the tip present it means we finished the
-                // headers sync first. We then need to compare to the tip from chain manager to see
-                // which blocks we are missing
-                match table.get(HEADER_TIP_KEY)? {
-                    Some(header) => {
-                        let chain_tip = chain_manager.get_block_index_tip();
-                        let chain_tip = (chain_tip.height(), chain_tip.block_hash().hash);
-                        info!("syncing blocks from height {}", chain_tip.0);
+        let headers_chain = HeadersChain::new(&data_dir, network.into())?;
+        let headers_chain_tip = headers_chain.tip();
 
-                        // if the tip from the headers sync is greater than tip from chain manager
-                        // it means we finished the header sync but didn't finish full block sync
-                        if header.value() > chain_tip.0 {
-                            SyncState::IBD(IBDState::BlockSync(chain_tip))
-                        } else {
-                            SyncState::InSync(chain_tip)
-                        }
-                    }
-                    None => SyncState::IBD(IBDState::HeaderSync),
-                }
-            }
-
-            Err(e) => match e {
-                // if this table does not exist, it means we are just starting IBD
-                redb::TableError::TableDoesNotExist(_) => SyncState::IBD(IBDState::HeaderSync),
-                _ => return Err(NodeError::DatabaseTableError(e)),
-            },
-        };
-
-        // channels on which to communicate new block info received from a peer
-        let (block_header_sender, block_header_receiver) = mpsc::channel(5);
-        let (block_sender, block_receiver) = mpsc::channel(10);
-
-        // TODO: better check how using this value in peer
-        let block_height = match sync_state {
-            SyncState::IBD(IBDState::HeaderSync) => {
-                let genesis = chain_manager.get_block_index_genesis();
-                (genesis.height(), genesis.block_hash().hash)
-            }
-            SyncState::IBD(IBDState::BlockSync(height)) => height,
-            SyncState::InSync(height) => height,
-        };
-
-        // channel to get the height of peer. Received in the version message
-        let (peer_height_sender, peer_height_receiver) = mpsc::channel(1);
-
-        let headers_chain = if let SyncState::IBD(IBDState::HeaderSync) = &sync_state {
-            info!("node is just starting. will do header synchronization");
-            // if just starting, initiate header chain with the genesis block header
-            let genesis_block = genesis_block(Params::new(Network::from(network)));
-            let genesis_header = BlockHeader::from_bitcoin_header(genesis_block.header, 0);
-            let headers_chain = HashMap::from([(genesis_block.block_hash(), genesis_header)]);
-            headers_chain
+        // if tip height is 0, it means we are just starting IBD and we need to
+        // start with headers synchronization
+        let sync_state = if headers_chain_tip.0 == 0 {
+            SyncState::IBD(IBDState::HeaderSync(HeaderSyncState::default()))
         } else {
-            // if in anything other than header sync then we should have a header chain stored in
-            // the db
-            let read_txn = db.begin_read()?;
-            let chain_header_table = read_txn.open_table(HEADER_CHAIN_TABLE)?;
-            construct_headers_chain(chain_header_table)?
+            // if we are done with headers sync first, we then need to compare to the
+            // tip from chain manager to see which blocks we are missing
+            let chain_tip = chain_manager.get_block_index_tip();
+            let chain_tip = BlockIndex(chain_tip.height(), chain_tip.block_hash().hash);
+            info!("syncing blocks from height {}", chain_tip.0);
+
+            // if the tip from the headers sync is greater than tip from chain manager
+            // it means we finished the header sync but didn't finish full block sync
+            if headers_chain_tip.0 > chain_tip.0 {
+                SyncState::IBD(IBDState::BlockSync(headers_chain_tip))
+            } else {
+                SyncState::InSync(chain_tip)
+            }
         };
 
-        let (sync_state_send, sync_state_recv) = broadcast::channel(1);
-        let send_2 = sync_state_send.clone();
-        let recv_2 = send_2.subscribe();
+        let block_height = match &sync_state {
+            SyncState::IBD(IBDState::HeaderSync(_)) => {
+                let genesis = chain_manager.get_block_index_genesis();
+                BlockIndex(genesis.height(), genesis.block_hash().hash)
+            }
+            SyncState::IBD(IBDState::BlockSync(height)) => height.clone(),
+            SyncState::InSync(height) => height.clone(),
+        };
 
         let shutdown_recv = shutdown_signal.1.clone();
+
+        // channel sender for peer manager to communicate messages that it received on the
+        // tcp connection and send back to node
+        let (peer_manager_sender, msg_processing_receiver) = broadcast::channel(500);
+
+        // sender for node to communicate to peer manager messages it wants written on the tcp
+        // connection
+        let (tcp_conn_sender, tcp_conn_receiver) = broadcast::channel(32);
+
+        let network = Network::from(network);
         let peer_manager = Arc::new(Mutex::new(PeerManager::new(
-            sync_state.clone(),
             block_height,
-            block_header_sender,
-            block_sender,
-            (send_2, recv_2),
-            peer_height_sender,
+            (tcp_conn_sender.clone(), tcp_conn_receiver),
+            peer_manager_sender,
             shutdown_recv,
-            Network::from(network),
+            network,
         )));
 
         Ok(Node {
-            db,
             sync_state,
             headers_chain,
             peer_manager,
             chain_manager,
-            block_header_receiver,
-            block_receiver,
-            sync_state_channel: (sync_state_send, sync_state_recv),
-            peer_height: peer_height_receiver,
+            tcp_conn_channel: (tcp_conn_sender, msg_processing_receiver),
             shutdown_signal,
+            network,
         })
-    }
-
-    fn valid_header(&self, header: Header) -> bool {
-        // still TODO:
-        // - validate timestamps (inside 2 hour range)
-        // - validate difficulty adjustments
-        // - validate height
-
-        // check that previous block points to a previously seen one
-        if !self.headers_chain.contains_key(&header.prev_blockhash) {
-            return false;
-        }
-
-        // validate the pow
-        if let Err(_) = header.validate_pow(header.target()) {
-            return false;
-        }
-
-        true
     }
 
     pub async fn run(mut self) {
@@ -225,156 +152,202 @@ impl Node {
             peer_manager.lock().await.run().await;
         });
 
-        // if doing header sync, wait to get the height from version msg from peer
-        let best_height = match self.sync_state {
-            SyncState::IBD(IBDState::HeaderSync) => self.peer_height.recv().await.unwrap(),
+        // the first message the peer struct will send in this channel will be
+        // the version since the handshake is done first
+        let best_height = match self.tcp_conn_channel.1.recv().await.unwrap().payload() {
+            NetworkMessage::Version(version) => version.start_height,
             _ => 0,
         };
 
-        let progress_points = vec![
-            (best_height as f64 * 0.16) as i32,
-            (best_height as f64 * 0.33) as i32,
-            (best_height as f64 * 0.5) as i32,
-            (best_height as f64 * 0.66) as i32,
-            (best_height as f64 * 0.83) as i32,
-            (best_height as f64 * 0.99) as i32,
-        ];
-        let mut current_progress_idx = 0;
+        let tcp_sender_clone = self.tcp_conn_channel.0.clone();
+        match self.sync_state {
+            SyncState::IBD(IBDState::HeaderSync(_)) => {
+                let block_hash = BlockHash::from_byte_array(self.headers_chain.tip().1);
+                let msg_to_send = self.build_get_headers_msg(vec![block_hash]).unwrap();
+                tcp_sender_clone.send(msg_to_send.clone()).unwrap();
 
-        // when this reaches best_height, we are done with header sync
-        let mut header_sync_height = 0;
-        // receive either block headers or blocks from peer and process them
+                info!("got best height {} from version message", best_height);
+                info!("in header synchronization. sending getheaders message");
+                self.sync_state = SyncState::IBD(IBDState::HeaderSync(HeaderSyncState {
+                    target_height: best_height,
+                    current_sync_height: 0,
+                }));
+            }
+            SyncState::IBD(IBDState::BlockSync(ref block_idx)) => {
+                let block_inventory = self
+                    .headers_chain
+                    .get_block_inventory(&BlockHash::from_byte_array(block_idx.1))
+                    .unwrap();
+
+                let msg_to_send =
+                    build_raw_network_msg(self.network, NetworkMessage::GetData(block_inventory))
+                        .unwrap();
+                self.tcp_conn_channel.0.send(msg_to_send).unwrap();
+            }
+            SyncState::InSync(ref block_idx) => {
+                let headers_msg = self
+                    .build_get_headers_msg(vec![BlockHash::from_byte_array(block_idx.1)])
+                    .unwrap();
+
+                self.tcp_conn_channel.0.send(headers_msg).unwrap();
+            }
+        };
+
+        // NOTE: send a sendheaders message here to get announce to peer we want to receive new
+        // block updates through header messages instead of inv.
+
+        // receive messages that peer sent us and process them
         loop {
             tokio::select! {
                 _ = self.shutdown_signal.1.changed() => {
                     break
                 }
-                block_headers = self.block_header_receiver.recv() => {
-                    let block_headers = match block_headers {
-                        Some(b) => b,
-                        None => {
-                            error!("terminating... channel closed");
-                            break;
-                        }
+                raw_network_msg  = self.tcp_conn_channel.1.recv() => {
+                    let raw_network_msg = raw_network_msg.unwrap();
+
+                    self.process_message(raw_network_msg).unwrap();
+                }
+            }
+        }
+    }
+
+    fn process_message(&mut self, msg: RawNetworkMessage) -> Result<(), NodeError> {
+        match msg.payload() {
+            NetworkMessage::Block(block) => {
+                let raw_block = consensus::encode::serialize(block);
+                let kernel_block = bitcoinkernel::Block::try_from(raw_block.as_slice())?;
+
+                // NOTE: according to comments in code from lib, first bool is
+                // if the block was valid and 2nd is if it's a new block.
+                // if valid and not a duplicate, update last block/height in peer
+                let (valid, new) = self.chain_manager.process_block(&kernel_block);
+                if valid && new {
+                    let tip_idx = self.chain_manager.get_block_index_tip();
+                    info!(
+                        "received new valid block. Updating to new tip height {} in peer",
+                        tip_idx.height()
+                    );
+
+                    // check if we have processed 500 blocks, if so, ask for next 500.
+                    // not ideal to do it this way
+                    let last_sync_block = match &self.sync_state {
+                        SyncState::IBD(IBDState::BlockSync(block_idx)) => block_idx.clone(),
+                        SyncState::InSync(block_idx) => block_idx.clone(),
+                        _ => BlockIndex(0, [0; 32]),
                     };
 
-                    for block_header in block_headers {
-                        if self.valid_header(block_header) {
-                            // if header is valid, add to header chain map
-                            let previous_height = self.headers_chain.get(&block_header.prev_blockhash).unwrap().height;
-                            let new_block_header = BlockHeader::from_bitcoin_header(block_header, previous_height + 1);
-                            self.headers_chain.insert(block_header.block_hash(), new_block_header);
-                            header_sync_height += 1;
-                            // TODO: change previous block header entry to have a next block
+                    if last_sync_block.0 + 499 < tip_idx.height() {
+                        info!("processed block batch. asking for new 500 batch");
 
-                            if current_progress_idx < progress_points.len() {
-                                if header_sync_height >= progress_points[current_progress_idx] {
-                                    info!("verifying headers - progress {}%", (current_progress_idx as f64 / progress_points.len() as f64 * 100.0) as u32);
-                                    current_progress_idx += 1;
-                                }
-                            }
-                        }
+                        self.sync_state = SyncState::InSync(BlockIndex(
+                            tip_idx.height(),
+                            tip_idx.block_hash().hash,
+                        ));
+
+                        let block_inventory =
+                            self.headers_chain
+                                .get_block_inventory(&BlockHash::from_byte_array(
+                                    tip_idx.block_hash().hash,
+                                ))?;
+
+                        let msg_to_send = build_raw_network_msg(
+                            self.network,
+                            NetworkMessage::GetData(block_inventory),
+                        )?;
+                        self.tcp_conn_channel.0.send(msg_to_send).unwrap();
                     }
+                }
 
-                    // we will only send on this channel when the entire header sync is done.
-                    // for now do not send intermediate progress for header sync
-                    if header_sync_height == best_height {
-                        info!("finished with headers sync at height {}. Will start full block sync.", header_sync_height);
-                        let genesis_index = self.chain_manager.get_block_index_genesis();
-                        // send new sync state. We are done with header sync and want to start full
-                        // block sync from genesis block
-                        if let Err(_) = self
-                            .sync_state_channel.0
-                            .send(SyncState::IBD(IBDState::BlockSync((
+                Ok(())
+            }
+            NetworkMessage::Headers(headers) => {
+                let block_headers = headers.to_vec();
+                let headers_len = block_headers.len() as i32;
+                let block_headers = self.headers_chain.process_headers(block_headers)?;
+
+                info!("got {} valid headers", headers_len);
+
+                match &self.sync_state {
+                    SyncState::IBD(IBDState::HeaderSync(sync_progress)) => {
+                        let new_sync_height = sync_progress.current_sync_height + headers_len;
+
+                        if new_sync_height >= sync_progress.target_height {
+                            info!(
+                                "finished with headers sync at height {}. Will start full block sync.",
+                                sync_progress.target_height
+                            );
+                            self.headers_chain.save_headers_chain()?;
+                            info!("saved headers chain to db");
+
+                            // change sync state to IBD block sync
+                            let genesis_index = self.chain_manager.get_block_index_genesis();
+                            self.sync_state = SyncState::IBD(IBDState::BlockSync(BlockIndex(
                                 genesis_index.height(),
                                 genesis_index.block_hash().hash,
-                            ))))
-                        {
-                            error!("could not send new sync state.");
-                        };
+                            )));
 
+                            // send get data message to start getting full blocks
+                            let block_inventory = self.headers_chain.get_block_inventory(
+                                &BlockHash::from_byte_array(genesis_index.block_hash().hash),
+                            )?;
 
-                        self.save_headers_chain(header_sync_height).unwrap();
-                        info!("saved headers chain to db");
-                    };
-                }
-                block = self.block_receiver.recv() => {
-                    let block = match block {
-                        Some(b) => b,
-                        None => {
-                            error!("terminating... channel closed");
-                            break;
+                            let msg_to_send = build_raw_network_msg(
+                                self.network,
+                                NetworkMessage::GetData(block_inventory),
+                            )?;
+                            self.tcp_conn_channel.0.send(msg_to_send).unwrap();
+                        } else {
+                            self.sync_state =
+                                SyncState::IBD(IBDState::HeaderSync(HeaderSyncState {
+                                    target_height: sync_progress.target_height,
+                                    current_sync_height: new_sync_height,
+                                }));
+
+                            let block_hash = BlockHash::from_byte_array(self.headers_chain.tip().1);
+                            let raw_headers_msg = self.build_get_headers_msg(vec![block_hash])?;
+                            self.tcp_conn_channel.0.send(raw_headers_msg).unwrap();
                         }
-                    };
+                        Ok(())
+                    }
+                    _ => {
+                        let block_inventory = headers
+                            .into_iter()
+                            .map(|header| Inventory::WitnessBlock(header.block_hash()))
+                            .collect();
 
-                    let raw_block = consensus::encode::serialize(&block);
-                    let kernel_block = match bitcoinkernel::Block::try_from(raw_block.as_slice()) {
-                        Ok(b) => b,
-                        Err(err) => {
-                            error!("invalid block {:?} ignoring for now", err);
-                            continue
-                        },
-                    };
+                        self.headers_chain.save_headers(block_headers)?;
 
-                    // NOTE: according to comments in code from lib, first bool is
-                    // if the block was valid and 2nd is if it's a new block.
-                    // if valid and not a duplicate, update last block/height in peer
-                    let (valid, new) = self.chain_manager.process_block(&kernel_block);
-                    if valid && new {
-                        let tip_idx = self.chain_manager.get_block_index_tip();
-                        info!("received new valid block. Updating to new tip height {} in peer", tip_idx.height());
+                        let msg_to_send = build_raw_network_msg(
+                            self.network,
+                            NetworkMessage::GetData(block_inventory),
+                        )?;
+                        self.tcp_conn_channel.0.send(msg_to_send).unwrap();
 
-                        if let Err(_) = self
-                            .sync_state_channel.0
-                            .send(SyncState::InSync((
-                                tip_idx.height(),
-                                tip_idx.block_hash().hash,
-                            )))
-                        {
-                            error!("could not send new tip on channel to peer");
-                        };
+                        Ok(())
                     }
                 }
             }
-        }
-    }
+            NetworkMessage::Inv(_) => {
+                // NOTE: should send a sendheader msg to receive notifications about new blocks
+                // through headers messages rather than inv
+                let block_hash = BlockHash::from_byte_array(self.headers_chain.tip().1);
+                let get_headers_msg = self.build_get_headers_msg(vec![block_hash])?;
+                self.tcp_conn_channel.0.send(get_headers_msg).unwrap();
 
-    // save current state of headers chain to db along with the tip
-    fn save_headers_chain(&self, height: i32) -> Result<(), NodeError> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut headers_chain_table = write_txn.open_table(HEADER_CHAIN_TABLE)?;
-            for (key, value) in &self.headers_chain {
-                let serialized_header = serde_json::to_vec(value)?;
-                headers_chain_table.insert(key.as_ref(), &serialized_header)?;
+                Ok(())
             }
+            _ => Ok(()),
         }
-        write_txn.commit()?;
-
-        let write_tip_txn = self.db.begin_write()?;
-        {
-            let mut header_tip_table = write_tip_txn.open_table(HEADER_TIP_TABLE)?;
-            header_tip_table.insert(HEADER_TIP_KEY, height)?;
-        }
-        write_tip_txn.commit()?;
-
-        Ok(())
-    }
-}
-
-// construct headers chain from db
-fn construct_headers_chain(
-    header_chain_table: ReadOnlyTable<[u8; 32], Vec<u8>>,
-) -> Result<HashMap<BlockHash, BlockHeader>, NodeError> {
-    let table_iter = header_chain_table.iter()?;
-    let mut header_chain = HashMap::new();
-
-    for result in table_iter {
-        let (key, value) = result?;
-        let block_hash = BlockHash::from_byte_array(key.value());
-        let deserialized_header: BlockHeader = serde_json::from_slice(value.value().as_slice())?;
-        header_chain.insert(block_hash, deserialized_header);
     }
 
-    Ok(header_chain)
+    fn build_get_headers_msg(
+        &self,
+        locator_hash: Vec<BlockHash>,
+    ) -> Result<RawNetworkMessage, NodeError> {
+        let get_headers_msg =
+            GetHeadersMessage::new(locator_hash, BlockHash::from_byte_array([0; 32]));
+        let raw_headers_msg =
+            build_raw_network_msg(self.network, NetworkMessage::GetHeaders(get_headers_msg))?;
+        Ok(raw_headers_msg)
+    }
 }
